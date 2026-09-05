@@ -46,7 +46,11 @@ def _pil_to_base64(img: Image.Image) -> str:
 
 
 def _call_groq(contents: list, custom_key: str = "") -> str:
-    """Call Groq API with vision capability (qwen/qwen3.8-27b)."""
+    """Call Groq API with vision capability (qwen/qwen3.8-27b).
+
+    Retries up to _MAX_RETRIES times on 429 (rate-limit) responses with
+    exponential backoff starting at _RETRY_BASE_DELAY seconds.
+    """
     import httpx
 
     api_key = _get_groq_key(custom_key)
@@ -64,22 +68,38 @@ def _call_groq(contents: list, custom_key: str = "") -> str:
         else:
             parts.append({"type": "text", "text": str(item)})
 
-    response = httpx.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "qwen/qwen3.8-27b",
-            "messages": [{"role": "user", "content": parts}],
-            "max_tokens": 1500,
-        },
-        timeout=60.0,
-    )
-    response.raise_for_status()
-    data = response.json()
-    return data["choices"][0]["message"]["content"].strip()
+    last_exc = None
+    for attempt in range(_MAX_RETRIES + 1):  # 0, 1, 2  →  initial + 2 retries
+        response = httpx.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "qwen/qwen3.8-27b",
+                "messages": [{"role": "user", "content": parts}],
+                "max_tokens": 1500,
+            },
+            timeout=60.0,
+        )
+        if response.status_code == 429:
+            last_exc = httpx.HTTPStatusError(
+                f"429 Too Many Requests", request=response.request, response=response
+            )
+            if attempt < _MAX_RETRIES:
+                wait = _RETRY_BASE_DELAY * (2 ** attempt)  # 4s, 8s
+                print(f"[SatQuery] Groq 429 rate-limited — retrying in {wait}s (attempt {attempt + 1}/{_MAX_RETRIES})…")
+                time.sleep(wait)
+                continue
+            # All retries exhausted
+            raise last_exc
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"].strip()
+
+    # Should not reach here, but just in case
+    raise last_exc or RuntimeError("Groq API call failed unexpectedly.")
 
 
 def _call_openrouter(contents: list, custom_key: str = "") -> str:
@@ -687,8 +707,71 @@ def build_trace(
 # Main inference pipeline
 # ---------------------------------------------------------------------------
 
+def _normalize_image(img):
+    """Convert various image input formats to a PIL Image.
+
+    Gradio may pass:
+      - A PIL Image (local dev, type="pil")
+      - A Gradio FileData object with .path / .url attrs (Gradio 6+)
+      - A dict  {"path": "/tmp/…", "url": "https://…"} (deployed / shared)
+      - A plain file-path string  (type="filepath")
+    This helper ensures we always get a PIL Image back.
+    """
+    if img is None:
+        return None
+    if isinstance(img, Image.Image):
+        return img
+
+    # --- Extract path / url from various container types ----------------
+    path = None
+    url = None
+
+    if isinstance(img, dict):
+        path = img.get("path", "")
+        url = img.get("url", "")
+    elif isinstance(img, str):
+        path = img
+    elif hasattr(img, "path"):  # Gradio FileData object
+        path = getattr(img, "path", None) or ""
+        url = getattr(img, "url", None) or ""
+    else:
+        # numpy array (another possible Gradio format)
+        try:
+            import numpy as np
+            if isinstance(img, np.ndarray):
+                return Image.fromarray(img)
+        except ImportError:
+            pass
+        raise gr.Error(f"Unsupported image format: {type(img)}")
+
+    # --- Try local path first, then URL ---------------------------------
+    if path and os.path.isfile(path):
+        return Image.open(path).copy()
+
+    if url:
+        import httpx
+        try:
+            resp = httpx.get(url, timeout=30, follow_redirects=True)
+            resp.raise_for_status()
+            return Image.open(io.BytesIO(resp.content)).copy()
+        except Exception as dl_err:
+            raise gr.Error(f"Could not download image from URL: {dl_err}")
+
+    # Path was given but file doesn't exist and no URL fallback
+    if path:
+        raise gr.Error(
+            f"Image file not found at '{path}'. "
+            f"This can happen on serverless deployments — please re-upload the image."
+        )
+    raise gr.Error("Received image data but could not locate the file. Please re-upload.")
+
+
 def run_query(image1, image2, question: str, custom_grok_key: str = "", custom_openrouter_key: str = ""):
     """Main entry point wired to the Submit button."""
+    # Normalize inputs — handles dicts, paths, URLs, and PIL images
+    image1 = _normalize_image(image1)
+    image2 = _normalize_image(image2)
+
     if image1 is None:
         raise gr.Error(
             "Please upload at least one image (Image 1 is required)."
@@ -1047,8 +1130,8 @@ def build_ui():
             with gr.Column(scale=5):
                 gr.Markdown("### 📥 Query & Image Uploads")
                 with gr.Row():
-                    img1 = gr.Image(label="Image 1 (Required: Optical / SAR / Primary)", type="pil")
-                    img2 = gr.Image(label="Image 2 (Optional: Temporal / Secondary)", type="pil")
+                    img1 = gr.Image(label="Image 1 (Required: Optical / SAR / Primary)", type="filepath")
+                    img2 = gr.Image(label="Image 2 (Optional: Temporal / Secondary)", type="filepath")
 
                 question_input = gr.Textbox(
                     label="Ask a question about the satellite imagery",
@@ -1110,4 +1193,4 @@ app = build_ui()
 theme = gr.themes.Soft(primary_hue="orange", neutral_hue="slate")
 
 if __name__ == "__main__":
-    app.launch(server_name="0.0.0.0", server_port=7860, show_error=True, css=CUSTOM_CSS, theme=theme)
+    app.launch(server_name="0.0.0.0", server_port=7860, show_error=True, css=CUSTOM_CSS, theme=theme, share=True)

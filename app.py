@@ -5,7 +5,7 @@ A natural-language assistant for satellite-image analysis.
 """
 
 from dotenv import load_dotenv
-load_dotenv()  # Load .env file (GOOGLE_API_KEY, etc.)
+load_dotenv()  # Load .env file (XAI_API_KEY, GROQ_API_KEY, etc.)
 
 import base64
 import io
@@ -20,15 +20,20 @@ import gradio as gr
 from PIL import Image, ImageDraw, ImageFont
 
 # ---------------------------------------------------------------------------
-# AI Provider — Gemini (primary) + Groq (fallback, 14 400 req/day free)
+# AI Provider — xAI Grok (primary) + Groq (fallback, 14 400 req/day free)
 # ---------------------------------------------------------------------------
 _gemini_client = None
-
-GEMINI_MODEL = "gemini-3.6-flash"
 
 # Retry settings
 _MAX_RETRIES = 2
 _RETRY_BASE_DELAY = 4  # seconds
+
+
+def _get_xai_key(custom_key: str = "") -> str:
+    """Retrieve xAI API key from custom input or env vars."""
+    if custom_key and custom_key.strip():
+        return custom_key.strip()
+    return os.environ.get("XAI_API_KEY", "").strip()
 
 
 def _get_groq_key(custom_key: str = "") -> str:
@@ -43,6 +48,64 @@ def _pil_to_base64(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _call_xai(contents: list, custom_key: str = "") -> str:
+    """Call xAI Grok Vision API (grok-2-vision-latest).
+
+    Uses the OpenAI-compatible endpoint at https://api.x.ai/v1.
+    Retries up to _MAX_RETRIES times on 429 (rate-limit) responses with
+    exponential backoff starting at _RETRY_BASE_DELAY seconds.
+    """
+    import httpx
+
+    api_key = _get_xai_key(custom_key)
+    if not api_key:
+        raise RuntimeError("XAI_API_KEY is missing. Please set XAI_API_KEY in .env or enter it in the UI.")
+
+    parts = []
+    for item in contents:
+        if isinstance(item, Image.Image):
+            b64 = _pil_to_base64(item)
+            parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{b64}"},
+            })
+        else:
+            parts.append({"type": "text", "text": str(item)})
+
+    last_exc = None
+    for attempt in range(_MAX_RETRIES + 1):  # 0, 1, 2  →  initial + 2 retries
+        response = httpx.post(
+            "https://api.x.ai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "grok-2-vision-latest",
+                "messages": [{"role": "user", "content": parts}],
+                "max_tokens": 1500,
+            },
+            timeout=60.0,
+        )
+        if response.status_code == 429:
+            last_exc = httpx.HTTPStatusError(
+                f"429 Too Many Requests", request=response.request, response=response
+            )
+            if attempt < _MAX_RETRIES:
+                wait = _RETRY_BASE_DELAY * (2 ** attempt)  # 4s, 8s
+                print(f"[SatQuery] xAI 429 rate-limited — retrying in {wait}s (attempt {attempt + 1}/{_MAX_RETRIES})…")
+                time.sleep(wait)
+                continue
+            # All retries exhausted
+            raise last_exc
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"].strip()
+
+    # Should not reach here, but just in case
+    raise last_exc or RuntimeError("xAI API call failed unexpectedly.")
 
 
 def _call_groq(contents: list, custom_key: str = "") -> str:
@@ -102,75 +165,34 @@ def _call_groq(contents: list, custom_key: str = "") -> str:
     raise last_exc or RuntimeError("Groq API call failed unexpectedly.")
 
 
-def _call_openrouter(contents: list, custom_key: str = "") -> str:
-    """Call OpenRouter's free vision model as a fallback."""
-    import httpx
-
-    api_key = custom_key.strip() if custom_key and custom_key.strip() else os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY not set")
-
-    parts = []
-    for item in contents:
-        if isinstance(item, Image.Image):
-            b64 = _pil_to_base64(item)
-            parts.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{b64}"},
-            })
-        else:
-            parts.append({"type": "text", "text": str(item)})
-
-    response = httpx.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "http://localhost:7860",
-            "X-Title": "SatQuery AI",
-        },
-        json={
-            "model": "openrouter/free",
-            "messages": [{"role": "user", "content": parts}],
-            "max_tokens": 1500,
-        },
-        timeout=60.0,
-    )
-    response.raise_for_status()
-    data = response.json()
-    return data["choices"][0]["message"]["content"].strip()
-
-
-def _call_ai(contents: list, custom_groq_key: str = "", custom_openrouter_key: str = "") -> str:
-    """Call AI with Groq (qwen/qwen3.8-27b) as primary engine."""
+def _call_ai(contents: list, custom_xai_key: str = "", custom_groq_key: str = "") -> str:
+    """Call AI with xAI Grok Vision as primary, Groq as fallback."""
     errors = []
 
-    # ── Primary: Groq Vision ──────────────────────────────────────────────
+    # ── Primary: xAI Grok Vision ─────────────────────────────────────────
+    xai_key = _get_xai_key(custom_xai_key)
+    if xai_key:
+        try:
+            return _call_xai(contents, xai_key)
+        except Exception as exc:
+            errors.append(f"xAI Grok: {exc}")
+
+    # ── Fallback: Groq Vision ────────────────────────────────────────────
     groq_key = _get_groq_key(custom_groq_key)
     if groq_key:
         try:
+            print("[SatQuery] Using Groq vision fallback…")
             return _call_groq(contents, groq_key)
         except Exception as exc:
             errors.append(f"Groq: {exc}")
 
-    # ── Fallback: OpenRouter Vision ──────────────────────────────────────
-    openrouter_key = custom_openrouter_key.strip() if custom_openrouter_key else os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if openrouter_key:
-        try:
-            print("[SatQuery] Using OpenRouter vision fallback…")
-            return _call_openrouter(contents, openrouter_key)
-        except Exception as exc:
-            errors.append(f"OpenRouter: {exc}")
-
     # ── Failure ─────────────────────────────────────────────────────────
-    error_summary = " | ".join(errors) if errors else "No Groq API Key configured"
+    error_summary = " | ".join(errors) if errors else "No API Key configured"
     raise gr.Error(
-        f"⚠️ Groq AI Provider Error:\n\n"
+        f"⚠️ AI Provider Error:\n\n"
         f"{error_summary}\n\n"
-        f"💡 Please check your GROQ_API_KEY in .env or on the web page under API Key Settings."
+        f"💡 Please check your XAI_API_KEY or GROQ_API_KEY in .env or on the web page under API Key Settings."
     )
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +319,7 @@ def classify_task(image1, image2, question: str) -> str:
 # Real task handlers — VQA & Grounding (xAI Grok Vision)
 # ---------------------------------------------------------------------------
 
-def handle_vqa(image: Image.Image, question: str, custom_grok_key: str = "", custom_openrouter_key: str = "") -> dict:
+def handle_vqa(image: Image.Image, question: str, custom_xai_key: str = "", custom_groq_key: str = "") -> dict:
     """Visual Question Answering via xAI Grok."""
     prompt = (
         "You are a satellite-image analysis assistant. "
@@ -306,7 +328,7 @@ def handle_vqa(image: Image.Image, question: str, custom_grok_key: str = "", cus
         f"Question: {question}"
     )
     try:
-        answer = _call_ai([image, prompt], custom_grok_key, custom_openrouter_key)
+        answer = _call_ai([image, prompt], custom_xai_key, custom_groq_key)
     except Exception as exc:
         answer = f"[Model error] {exc}"
 
@@ -349,7 +371,7 @@ def _draw_boxes(image: Image.Image, boxes: list[list[int]]) -> Image.Image:
     return img
 
 
-def handle_grounding(image: Image.Image, question: str, custom_grok_key: str = "", custom_openrouter_key: str = "") -> dict:
+def handle_grounding(image: Image.Image, question: str, custom_xai_key: str = "", custom_groq_key: str = "") -> dict:
     """Object grounding via xAI Grok — returns bounding boxes."""
     prompt = (
         "You are a satellite-image analysis assistant specializing in "
@@ -364,7 +386,7 @@ def handle_grounding(image: Image.Image, question: str, custom_grok_key: str = "
         "Bounding box: [120, 340, 450, 780]\n"
     )
     try:
-        raw_text = _call_ai([image, prompt], custom_grok_key, custom_openrouter_key)
+        raw_text = _call_ai([image, prompt], custom_xai_key, custom_groq_key)
     except Exception as exc:
         return {
             "answer": f"[Model error] {exc}",
@@ -412,7 +434,7 @@ def _make_side_by_side(img1: Image.Image, img2: Image.Image) -> Image.Image:
     return combined
 
 
-def handle_change_detection(image1: Image.Image, image2: Image.Image | None, question: str, custom_grok_key: str = "", custom_openrouter_key: str = "") -> dict:
+def handle_change_detection(image1: Image.Image, image2: Image.Image | None, question: str, custom_xai_key: str = "", custom_groq_key: str = "") -> dict:
     """Bi-temporal Change Detection via xAI Grok."""
     if image2 is None:
         return {
@@ -429,7 +451,7 @@ def handle_change_detection(image1: Image.Image, image2: Image.Image | None, que
         f"Question: {question}"
     )
     try:
-        answer = _call_ai([image1, image2, prompt], custom_grok_key, custom_openrouter_key)
+        answer = _call_ai([image1, image2, prompt], custom_xai_key, custom_groq_key)
         confidence = 0.84
     except Exception as exc:
         answer = f"[Model error] {exc}"
@@ -443,7 +465,7 @@ def handle_change_detection(image1: Image.Image, image2: Image.Image | None, que
     }
 
 
-def handle_fusion(image1: Image.Image, image2: Image.Image | None, question: str, custom_grok_key: str = "", custom_openrouter_key: str = "") -> dict:
+def handle_fusion(image1: Image.Image, image2: Image.Image | None, question: str, custom_xai_key: str = "", custom_groq_key: str = "") -> dict:
     """Multi-sensor / multi-band data fusion via xAI Grok."""
     if image2 is None:
         return {
@@ -459,202 +481,7 @@ def handle_fusion(image1: Image.Image, image2: Image.Image | None, question: str
         f"Question: {question}"
     )
     try:
-        answer = _call_ai([image1, image2, prompt], custom_grok_key, custom_openrouter_key)
-        confidence = 0.88
-    except Exception as exc:
-        answer = f"[Model error] {exc}"
-        confidence = 0.0
-
-    evidence = _make_side_by_side(image1, image2)
-    return {
-        "answer": answer,
-        "confidence": confidence,
-        "evidence_image": evidence,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Trace builder
-# ---------------------------------------------------------------------------
-
-def build_trace(
-    question: str,
-    detected_task: str,
-    image_count: int,
-    modalities: list,
-    model_output: dict,
-    confidence: float,
-    evidence_path: str | None,
-    final_answer: str,
-) -> dict:
-    """Build the execution-trace JSON conforming to the fixed schema."""
-    return {
-        "query_id": str(uuid.uuid4()),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "user_query": question,
-        "detected_task": detected_task,
-        "input_validation": {
-            "image_count": image_count,
-            "modalities": modalities,
-            "co_registration_status": (
-                "not_applicable" if image_count < 2 else "pass"
-            ),
-        },
-        "selected_adapter": ADAPTER_MAP.get(detected_task, "unknown"),
-        "model_output": model_output,
-        "confidence": confidence,
-        "evidence_refs": [evidence_path] if evidence_path else [],
-        "final_answer": final_answer,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Main inference pipeline
-# ---------------------------------------------------------------------------
-
-def run_query(image1, image2, question: str, custom_grok_key: str = "", custom_openrouter_key: str = ""):
-    """Main entry point wired to the Submit button."""
-    if image1 is None:
-        raise gr.Error(
-            "Please upload at least one image (Image 1 is required)."
-        )
-    if not question or not question.strip():
-        question = "What land cover types, terrain features, and structures are visible in this satellite image?"
-
-    image_count = 1 if image2 is None else 2
-    modalities = ["optical"]
-    if image_count == 2:
-        modalities = ["optical", "optical"]
-
-    detected_task = classify_task(image1, image2, question)
-    task_label = f"🛰️  Detected Task:  **{TASK_LABELS[detected_task]}**"
-
-    if detected_task == "vqa":
-        result = handle_vqa(image1, question, custom_grok_key, custom_openrouter_key)
-    elif detected_task == "grounding":
-        result = handle_grounding(image1, question, custom_grok_key, custom_openrouter_key)
-    elif detected_task == "change_vqa":
-        result = handle_change_detection(image1, image2, question, custom_grok_key, custom_openrouter_key)
-        bottom = int(y_max / 1000 * h)
-        draw.rectangle(
-            [left, top, right, bottom],
-            outline="red",
-            width=max(3, int(min(w, h) * 0.005)),
-        )
-    return img
-
-
-def handle_grounding(image: Image.Image, question: str, custom_grok_key: str = "", custom_openrouter_key: str = "") -> dict:
-    """Object grounding via xAI Grok — returns bounding boxes."""
-    prompt = (
-        "You are a satellite-image analysis assistant specializing in "
-        "object detection and spatial localization.\n\n"
-        f"Task: {question}\n\n"
-        "Return a bounding box for each relevant object in the format "
-        "[y_min, x_min, y_max, x_max] where coordinates are integers "
-        "from 0 to 1000 (normalised to image dimensions). "
-        "Also provide a brief text description of what you found.\n"
-        "Example output format:\n"
-        "Object: Airport runway\n"
-        "Bounding box: [120, 340, 450, 780]\n"
-    )
-    try:
-        raw_text = _call_ai([image, prompt], custom_grok_key, custom_openrouter_key)
-    except Exception as exc:
-        return {
-            "answer": f"[Model error] {exc}",
-            "confidence": 0.0,
-            "evidence_image": image,
-        }
-
-    boxes = _parse_bounding_boxes(raw_text)
-    if boxes:
-        evidence = _draw_boxes(image, boxes)
-        answer = raw_text
-        confidence = 0.82
-    else:
-        evidence = image
-        answer = (
-            raw_text if raw_text
-            else "Could not determine bounding boxes for this query."
-        )
-        confidence = 0.40
-
-    return {
-        "answer": answer,
-        "confidence": confidence,
-        "evidence_image": evidence,
-    }
-
-
-def _make_side_by_side(img1: Image.Image, img2: Image.Image) -> Image.Image:
-    """Create a side-by-side comparative visualization for change detection / fusion."""
-    w1, h1 = img1.size
-    w2, h2 = img2.size
-    target_h = max(h1, h2)
-    i1 = img1.resize((int(w1 * target_h / h1), target_h))
-    i2 = img2.resize((int(w2 * target_h / h2), target_h))
-
-    gutter = 10
-    header_h = 35
-    combined = Image.new("RGB", (i1.width + i2.width + gutter, target_h + header_h), (15, 23, 42))
-    draw = ImageDraw.Draw(combined)
-    draw.text((10, 8), "IMAGE 1 (BEFORE)", fill=(241, 245, 249))
-    draw.text((i1.width + gutter + 10, 8), "IMAGE 2 (AFTER)", fill=(241, 245, 249))
-
-    combined.paste(i1, (0, header_h))
-    combined.paste(i2, (i1.width + gutter, header_h))
-    return combined
-
-
-def handle_change_detection(image1: Image.Image, image2: Image.Image | None, question: str, custom_grok_key: str = "", custom_openrouter_key: str = "") -> dict:
-    """Bi-temporal Change Detection via xAI Grok."""
-    if image2 is None:
-        return {
-            "answer": "Bi-temporal change detection requires two images (Before and After). Please upload Image 2.",
-            "confidence": 0.0,
-            "evidence_image": image1,
-        }
-
-    prompt = (
-        "You are a satellite-image analysis assistant specializing in bi-temporal change detection. "
-        "The first image is Image 1 (Before/Earlier) and the second image is Image 2 (After/Later). "
-        "Analyze the temporal differences, structural changes, land cover alterations, or new developments "
-        "between these two satellite images.\n\n"
-        f"Question: {question}"
-    )
-    try:
-        answer = _call_ai([image1, image2, prompt], custom_grok_key, custom_openrouter_key)
-        confidence = 0.84
-    except Exception as exc:
-        answer = f"[Model error] {exc}"
-        confidence = 0.0
-
-    evidence = _make_side_by_side(image1, image2)
-    return {
-        "answer": answer,
-        "confidence": confidence,
-        "evidence_image": evidence,
-    }
-
-
-def handle_fusion(image1: Image.Image, image2: Image.Image | None, question: str, custom_grok_key: str = "", custom_openrouter_key: str = "") -> dict:
-    """Multi-sensor / multi-band data fusion via xAI Grok."""
-    if image2 is None:
-        return {
-            "answer": "Optical + SAR fusion analysis requires two multi-sensor images. Please upload Image 2.",
-            "confidence": 0.0,
-            "evidence_image": image1,
-        }
-
-    prompt = (
-        "You are a satellite-image analysis assistant specializing in multi-sensor data fusion (e.g. Optical + SAR). "
-        "Image 1 and Image 2 contain complementary sensor information of the same region. "
-        "Fuse details from both modalities to provide a comprehensive answer.\n\n"
-        f"Question: {question}"
-    )
-    try:
-        answer = _call_ai([image1, image2, prompt], custom_grok_key, custom_openrouter_key)
+        answer = _call_ai([image1, image2, prompt], custom_xai_key, custom_groq_key)
         confidence = 0.88
     except Exception as exc:
         answer = f"[Model error] {exc}"
@@ -766,7 +593,7 @@ def _normalize_image(img):
     raise gr.Error("Received image data but could not locate the file. Please re-upload.")
 
 
-def run_query(image1, image2, question: str, custom_grok_key: str = "", custom_openrouter_key: str = ""):
+def run_query(image1, image2, question: str, custom_xai_key: str = "", custom_groq_key: str = ""):
     """Main entry point wired to the Submit button."""
     # Normalize inputs — handles dicts, paths, URLs, and PIL images
     image1 = _normalize_image(image1)
@@ -788,13 +615,13 @@ def run_query(image1, image2, question: str, custom_grok_key: str = "", custom_o
     task_label = f"🛰️  Detected Task:  **{TASK_LABELS[detected_task]}**"
 
     if detected_task == "vqa":
-        result = handle_vqa(image1, question, custom_grok_key, custom_openrouter_key)
+        result = handle_vqa(image1, question, custom_xai_key, custom_groq_key)
     elif detected_task == "grounding":
-        result = handle_grounding(image1, question, custom_grok_key, custom_openrouter_key)
+        result = handle_grounding(image1, question, custom_xai_key, custom_groq_key)
     elif detected_task == "change_vqa":
-        result = handle_change_detection(image1, image2, question, custom_grok_key, custom_openrouter_key)
+        result = handle_change_detection(image1, image2, question, custom_xai_key, custom_groq_key)
     elif detected_task == "fusion":
-        result = handle_fusion(image1, image2, question, custom_grok_key, custom_openrouter_key)
+        result = handle_fusion(image1, image2, question, custom_xai_key, custom_groq_key)
     else:
         raise gr.Error(f"Unknown task type: {detected_task}")
 
@@ -1143,14 +970,14 @@ def build_ui():
 
                 # System Settings Accordion placed DIRECTLY BELOW Analyze Image button
                 with gr.Accordion("⚙️ System Settings & API Keys", open=False):
-                    ui_groq_key = gr.Textbox(
-                        label="Custom Groq API Key (Optional)",
-                        placeholder="gsk_...",
+                    ui_xai_key = gr.Textbox(
+                        label="Custom xAI API Key (Optional)",
+                        placeholder="xai-...",
                         type="password",
                     )
-                    ui_openrouter_key = gr.Textbox(
-                        label="Custom OpenRouter API Key (Optional)",
-                        placeholder="sk-or-...",
+                    ui_groq_key = gr.Textbox(
+                        label="Custom Groq API Key (Optional — Fallback)",
+                        placeholder="gsk_...",
                         type="password",
                     )
 
@@ -1175,7 +1002,7 @@ def build_ui():
         # Wire Submit Button
         submit_btn.click(
             fn=run_query,
-            inputs=[img1, img2, question_input, ui_groq_key, ui_openrouter_key],
+            inputs=[img1, img2, question_input, ui_xai_key, ui_groq_key],
             outputs=[task_label_output, answer_output, confidence_output, evidence_output, trace_output],
         )
 

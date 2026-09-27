@@ -1,22 +1,3 @@
 {
-<<<<<<< HEAD
   "buildCommand": "npm run build"
 }
-=======
-  "builds": [
-    {
-      "src": "api/index.py",
-      "use": "@vercel/python",
-      "config": {
-        "maxDuration": 60
-      }
-    }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "api/index.py"
-    }
-  ]
-}
->>>>>>> 4f61496921ce3cb46827b1cf2eafcb33b5daa50e
